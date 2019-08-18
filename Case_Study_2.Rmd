@@ -9,7 +9,374 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
+# Classifying Attrition
+
+Our goal in this study is to use the available data to best identify which factors lead to worker attrition. 
+
+We read in the data here, and perform some early data exploration. We reclassify the Attrition variable to a binary numeric data type, and log transform the Monthly Income, Distance from Home, and Total Working Years since normality is a requirement for linear regression. We also drop certain columns that have no explanatory power - employee count is an ID variable, and Over18, EmployeeCount, and StandardHours have no variation.
+
+Fortunately, there are no missing values that need accounting for. 
+
 ```{r, echo=T}
 # Read in data
+library(data.table, quietly=T)
+library(MASS, quietly=T)
+library(caret)
+library(pROC)
+library(fastDummies)
+library(dplyr, quietly=T)
+library(readxl)
+library(sjPlot)
+library(ggplot2)
+
+data <- fread('~/MSDS-6306-Doing-Data-Science/Unit 14/CaseStudy2-data.csv')
+
+# Transformation: log transform MonthlyIncome, DistanceFromHome, TotalWorkingYears
+data[, MonthlyIncome := log(MonthlyIncome)]
+data[, DistanceFromHome := log(DistanceFromHome)]
+data[, TotalWorkingYears := log(TotalWorkingYears+.5)]
+# Turn Attrition into numeric binary
+data[, Attrition := ifelse(Attrition=="Yes", 1, 0)]
+
+# Look for columns with only 1 level
+data[, lapply(.SD, function(x) {if(length(unique(x)) == 1 | length(unique(x)) == .N) x[1]})]
+# Drop EmployeeCount, Over18, EmployeeNumber, StandardHours - not useful
+data[, c("EmployeeCount", "Over18", "EmployeeNumber", "StandardHours") := NULL]
+
+# Look for NAs - No NAs
+any(is.na(data))
+
+# Drop ID - don't need it for training, only for validation
+data[, ID := NULL]
 
 ```
+
+The first question of interest is whether we can predict the attrition variable using other explanatory tools at hand. I will consider two methods here - K nearest neighbors, and logistic regression. 
+
+We start off with 3 logistic regression models utilizing the forward, backward, and stepwise directions. After creating these fits, we pull the variables that are jointly significant between all 3 models to serve as a starting point for K nearest neighbors. 
+
+```{r, echo=T}
+
+#1) Predict attrition
+
+# # First do stepwise logistic, to see if there are any common variables
+
+data_names <- grep("Attrition|ID", names(data), invert=T, value=T)
+data_names <- paste(data_names, collapse = "+")
+form <- as.formula(paste0("Attrition~", data_names))
+
+forward_mod <- step(glm(formula = form, data=data, family = 'binomial'), direction='forward', trace = 0)
+backward_mod <- step(glm(formula = form, data=data, family = 'binomial'), direction='backward', trace=0)
+step_mod <- step(glm(formula = form, data=data, family = 'binomial'), direction='both', trace=0)
+
+# Looks like backward and stepwise models are identical
+all.equal(backward_mod, step_mod)
+
+# Grab significant variables
+forward_vars <- summary(forward_mod)$coefficients[,4]
+forward_sig_vars <- names(forward_vars[forward_vars < .05/3])
+backward_vars <- summary(backward_mod)$coefficients[,4]
+backward_sig_vars <- names(backward_vars[backward_vars<.05/3])
+
+# Find intersection
+intersect(forward_sig_vars, backward_sig_vars)
+
+# From this, let's grab the commonly significant variables for KNN
+
+vars_for_knn <- c('BusinessTravel', 'DistanceFromHome', 'EnvironmentSatisfaction', 'JobInvolvement', 'JobSatisfaction', 'MaritalStatus', 'NumCompaniesWorked', 'OverTime', 'RelationshipSatisfaction', 'TotalWorkingYears', 'WorkLifeBalance', 'YearsSinceLastPromotion')
+```
+
+Before running our KNN model, we need one last bit of data wrangling. KNN cannot handle categorical or factor variables, so the 3 we have here - business travel frequency, marital status, and over time pay - must be recoded to numeric binary variables. 
+
+Since only one level of each of these variables was significant in the earlier models, we will group together the "Married" and "Divorced" marital status groups, as well as the "Travel Rarely" and "Non Travel" travel frequency groups. 
+
+```{r, echo=T}
+# Make dummy columns for KNN
+knn_subset <- data[, .SD, .SDcols=c("Attrition", vars_for_knn)]
+knn_subset <- fastDummies::dummy_cols(knn_subset, select_columns=c("BusinessTravel", "MaritalStatus", "OverTime"))
+knn_subset[, c("BusinessTravel", "MaritalStatus", "OverTime", "BusinessTravel_Travel_Rarely", "BusinessTravel_Non-Travel", "MaritalStatus_Divorced","MaritalStatus_Married", "OverTime_No") := NULL]
+
+vars_for_knn <- grep("Attrition", names(knn_subset), invert=T, value=T)
+
+knn_form <- as.formula(paste0("Attrition ~ ", paste(vars_for_knn, collapse = "+")))
+
+```
+
+Now we are ready for KNN. We begin by creating a training and a test data set, with 60% of the observations in the training set. 
+
+In order to determine the optimal k, we fit the KNN model for all values of k between 1 and 20. 
+
+```{r, echo=T}
+
+# Make test and training sets
+set.seed(10)
+training <- sample(1:nrow(knn_subset), size=round(0.6*nrow(knn_subset)))
+test <- setdiff(knn_subset[, .I], training)
+train_set <- knn_subset[training, .SD, .SDcols=vars_for_knn]
+test_set <- knn_subset[test, .SD, .SDcols= vars_for_knn]
+# Labels
+cl <- knn_subset[training, Attrition]
+true_labs <- knn_subset[test, Attrition]
+
+# Fit KNN model
+# Test various k's
+for (k in 1:20) {
+  temp_fit <- caret::knnreg(x=train_set, y=cl, k=k)
+  predicted <- predict(temp_fit, test_set)
+  pred2 <- ifelse(predicted <= .1609195, 0, 1)
+  num_incorrect <- sum(pred2 != true_labs)
+  misclass <- round(num_incorrect / nrow(test_set), digits=3)
+  print(paste0("k = ", k, "; misclassification=", misclass))
+}
+
+# Elbow plot
+sjc.elbow(train_set, steps=15)
+
+# Fit both k=1 and k=3 classification
+knn1fit <- caret::knnreg(x=train_set, y=cl, k=1)
+knn3fit <- caret::knnreg(x=train_set, y=cl, k=3)
+```
+
+We see the lowest misclassification rate at k=1, while the elbow plot shows k=3 to be a more suited k-value for analysis. Upon examining the sensitivity and specificity of our predictions, it appears our Nearest Neighbor model was overly "pessimistic," correctly identifying almost all non-responses and missing 3/4 of the successes. By contrast, the k=3 model has much more balanced sensitivity and specificity results. 
+
+
+```{r, echo=T}
+
+# Error analysis
+confusion <- data.table(
+  true_labels = true_labs,
+  predicted_k1 = ifelse(predict(knn1fit, test_set) <= .1609, 0, 1), # Use .1609 as a prior since that is the distribution of Attrition in original data
+  predicted_k3 = ifelse(predict(knn3fit, test_set) <= .1609, 0, 1)
+)
+
+knn_fits <- data.table(
+  measure = c("k1 sensitivity", "k1 specificity", "k1 error", "k3 sensitivity", "k3 specificity", "k3 error"),
+  values = c(nrow(confusion[predicted_k1 == 1 & true_labels==1]) / nrow(confusion[true_labels==1]),
+             nrow(confusion[predicted_k1 == 0 & true_labels==0]) / nrow(confusion[true_labels==0]),
+             nrow(confusion[predicted_k1 != true_labels]) / nrow(confusion),
+             nrow(confusion[predicted_k3 == 1 & true_labels==1]) / nrow(confusion[true_labels==1]),
+             nrow(confusion[predicted_k3 == 0 & true_labels==0]) / nrow(confusion[true_labels==0]),
+             nrow(confusion[predicted_k3 != true_labels]) / nrow(confusion)
+             )
+)
+
+knn_fits
+```
+
+Neither of these models demonstrate enough explanatory power to be useful predictors of job attrition. Neither can correctly identify more than 50% of the positives and negative responses, so we will look at alternatives. 
+
+Returning to our initial variable selection process, we will use those selected variables in a logistic regression, and remake the same confusion table to recalculate sensitivity and specificity. 
+
+The assumptions for multivariate logistic regression are a multivariate normal distribution across explanatory variables and independence. We have already addressed some of the normality concerns in the data, but the multivariate central limit theorem also ensures some robustness against this assumption. There is no reason to suspect lack of independence in the data sampling procedure, so we consider this assumption met as well. 
+
+
+```{r, echo=T}
+# Logit predict
+log_mod <- glm(formula = knn_form, data= knn_subset[training], family='binomial')
+plot(log_mod, 2)
+
+confusion <- data.table(
+  true_labels = true_labs,
+  predicted = ifelse(predict(log_mod, test_set, type='response') <= .1609, 0, 1)
+)
+
+logit_fit <- data.table(
+  fit_statistic = c("Sensitivity", "Specificity", "Error", "AIC"),
+  value = c(nrow(confusion[predicted ==1 & true_labels==1]) / nrow(confusion[true_labels==1]),
+            nrow(confusion[predicted == 0 & true_labels==0]) / nrow(confusion[true_labels==0]),
+            nrow(confusion[predicted != true_labels]) / nrow(confusion),
+            extractAIC(log_mod)[2])
+)
+
+logit_fit
+
+```
+
+We see that the logistic model does a much better job of predicting attrition, correctly identifying 83% of the attrition=yes responses and 73% of the attrition=No responses. The ROC plot and area under the curve statistic do not suggest fantastic explanatory power in general, but considering how well our model fits the test set, we will move forward with this logistic regression model. 
+
+```{r, echo=T}
+summary(log_mod)
+roc_obj <- pROC::roc(response=confusion$predicted, predictor = confusion$true_labels, plot=T, xlim = c(1, 0), print.auc=T)
+```
+
+From examining the summary of the logistic model, we see that the strongest indicators of attrition, judging by the p-values, are the total number of working years, whether the worker gets overtime or not, and the number of years since his/her last promotion. 
+
+```{r, echo=T}
+
+# Predict missing values
+validation_set_attrition <- fread("~/MSDS-6306-Doing-Data-Science/UNIT 14/CaseStudy2CompSet No Attrition.csv")
+
+# Apply transformations
+validation_set_attrition[, DistanceFromHome := log(DistanceFromHome)]
+validation_set_attrition[, TotalWorkingYears := log(TotalWorkingYears + 0.5)]
+validation_set_attrition <- fastDummies::dummy_cols(validation_set_attrition, select_columns = c("BusinessTravel", "MaritalStatus", "OverTime"))
+validation_set_attrition[, c("BusinessTravel", "MaritalStatus", "OverTime", "BusinessTravel_Travel_Rarely", "BusinessTravel_Non-Travel", "MaritalStatus_Divorced","MaritalStatus_Married", "OverTime_No") := NULL]
+
+validation_preds <- predict(log_mod, validation_set_attrition, type='response')
+output <- data.table(ID=validation_set_attrition$ID,Attrition = ifelse(validation_preds <= .1609, "No", "Yes"))
+fwrite(output, "~/dds_casestudy_2/Case2PredictionsShaw Attrition.csv")
+```
+
+# Predicting Monthly Salary
+
+Our goal in this study is to use available data to best predict a worker's monthly salary. We'll use the same dataset as for analysis of worker attrition, with the same initial data transformations. 
+
+We'll begin by doing a similar procedure as we did in predicting attrition. With such a wide array of potential explanatory variables, we will begin by using stepwise selection techniques, and look at the commonly significant variables. 
+
+```{r, echo=T}
+
+
+forward_mod <- step(glm(formula = MonthlyIncome ~ ., data=data), direction='forward', trace=0)
+backward_mod <- step(glm(formula = MonthlyIncome ~ ., data=data), direction='backward', trace=0)
+step_mod <- step(glm(formula = MonthlyIncome ~ ., data=data), direction='both', trace=0)
+
+# Again, backward and stepwise models exactly agree
+all.equal(backward_mod, step_mod)
+
+# Pull jointly significant variables
+forward_vars <- summary(forward_mod)$coefficients[,4]
+forward_sig_vars <- names(forward_vars[forward_vars < .05/3])
+backward_vars <- summary(backward_mod)$coefficients[,4]
+backward_sig_vars <- names(backward_vars[backward_vars<.05/3])
+
+# Find intersection
+intersect(forward_sig_vars, backward_sig_vars)
+
+```
+
+From our stepwise selection methods, the jointly significant predictors appear to be job level, job role, and the total number of working years. 
+
+```{r, echo=T}
+
+# Make test and training sets
+set.seed(10)
+training <- sample(1:nrow(data), size=round(0.6*nrow(data)))
+train_set <- data[training, ]
+test_set <- data[-training, ]
+
+linear_mod <- lm(data=train_set, formula = MonthlyIncome ~ JobLevel + JobRole + TotalWorkingYears)
+
+# Plot residuals
+plot(linear_mod)
+
+```
+
+The assumptions for multiple linear regression are normality of residuals, homoscedasticity, independence, lack of autocorrelation, and lack of multicollinearity. The residuals plot shows little evidence of any trend in the residuals, and the residuals appear to share a normal distribution across all values of leverage. Additionally, there are very few outliers in this dataset. 
+
+There is no reason to suspect any independence, or autocorrelation. We can test for multicollinearity between our two numeric explanatory variables, by plotting the two against each other. 
+
+```{r, echo=T}
+
+plot(data$JobLevel, data$TotalWorkingYears, main="Logged Total Working Years by Job Level", xlab="Job Level", ylab="Logged Total Working Years")
+
+```
+
+There may be some evidence of a trend between job level and the logged total working years, but there isn't any conclusive proof we can draw from this plot of a linear relationship. Additionally, there is clear heteroscedasticity in this linear relationship, so the assumptions for linear regression between these two variables are violated. We will assume we have satisfied the lack of multicollinearity assumption. 
+
+The final model:
+
+```{r, echo=T}
+summary(linear_mod)
+ggplot(data=data[, mean(exp(MonthlyIncome)), by='JobRole'], aes(x=reorder(JobRole, -V1), y=V1)) +
+  geom_bar(stat='identity') +
+  theme_bw() +
+  xlab("Job Role") +
+  ylab("Average Monthly Income") +
+  theme(axis.text.x = element_text(angle=45, hjust=1)) +
+  ggtitle("Average Monthly Income by Job Role")
+
+```
+
+We see positive correlation between job level and total working years, as expected. Looking at the average monthly salary by job role, we see roughly 3 tiers of salaries, which could be interesting. The drop offs from research directors to manufacturing directors and from sales executives to human resources are much larger than any other drop offs. 
+
+The next step is to fit our model to our test dataset, and examine the fit statistics. 
+
+```{r, echo=T}
+
+lin_output <- data.table(
+  predicted = exp(predict(linear_mod, test_set)),
+  actual = exp(test_set$MonthlyIncome)
+)
+
+# Fit statistics
+fits <- data.table(
+  measure = c("Adjusted R Squared", "AIC", "RMSE"), 
+  value = c(summary(linear_mod)$adj.r.squared, extractAIC(linear_mod)[2], sqrt(sum(lin_output[, (predicted - actual)^2])/nrow(lin_output)))
+)
+
+fits
+
+```
+
+The adjusted R-squared value and RMSE are very promising in terms of indicating goodness of fit. The AIC measure is also superior to what we have in our stepwise models. We will move forward and use this model to fit our validation set. 
+
+```{r, echo=T}
+
+income_validation <- readxl::read_excel("~/MSDS-6306-Doing-Data-Science/UNIT 14/CaseStudy2CompSet No Salary.xlsx") %>% as.data.table
+
+income_validation[, TotalWorkingYears := log(TotalWorkingYears + 0.5)]
+
+# Output set - don't forget to antilog the predicted monthly income
+income_output <- data.table(
+  ID = income_validation$ID,
+  MonthlyIncome = exp(predict(linear_mod, income_validation))
+)
+
+fwrite(income_output, "~/dds_casestudy_2/Case2PredictionsShaw MonthlyIncome.csv")
+
+```
+
+# Conclusion
+
+In addressing the questions of interest, we found that the best predictors of worker attrition are the total number of working years, whether the worker gets overtime or not, and the number of years since his/her last promotion. Using this model, we were able to correctly identify 83% of the workers who left and 73% of the workers who stayed. We see that non-overtime-exempt workers and workers who have not been promoted in a while are more likely to leave, and that employees who have been in the workforce longer are less likely to leave. 
+
+The best predictors for the monthly income are the employee's job role, job level, and total working years. Unsurprisingly, higher job levels and longer-tenured employees generally earn a higher monthly income. 
+
+# Appendix
+
+In the course of investigating the questions of interest, here are some more trends that may be useful. 
+
+```{r, echo=T}
+
+# Miscellaneous findings
+# Average working years by Job Role - take exponent since we took log transform earlier
+ggplot(data=data[, mean(exp(TotalWorkingYears)), by='JobRole'], aes(x=reorder(JobRole, -V1), y=V1)) +
+  geom_bar(stat='identity') +
+  theme_bw() +
+  xlab("Job Role") +
+  ylab("Average Total Working Years") +
+  theme(axis.text.x = element_text(angle=90, hjust=1)) +
+  ggtitle("Average Working Years by Job Role")
+```
+
+Unsurprisingly, executives, managers, and directors tend to be the longest tenured employees. Interestingly, health care representatives are the 3rd longest tenured class of employees on average, compared to sales representatives who are the shortest tenured employees. 
+
+```{r, echo=T}
+
+# Employees by Education Field
+ggplot(data=data[, .N, by='EducationField'], aes(x=reorder(EducationField, -N), y=N)) +
+  geom_bar(stat='identity') +
+  theme_bw() +
+  xlab("Education Field") +
+  theme(axis.text.x = element_text(angle=90, hjust=1)) +
+  ggtitle("Employees by Education Field")
+```
+
+The vast majority of employees studied eiher life sciences or a medical field, accounting for 72% of the employees. 
+
+```{r, echo=T}
+# Attrition percentage by Job Role
+ggplot(data=data[, sum(Attrition)/ .N, by='JobRole'], aes(x=reorder(JobRole, -V1), y=V1)) +
+  geom_bar(stat='identity') +
+  theme_bw() +
+  xlab("Job Role") +
+  ylab("Percentage of Employees Leaving") +
+  theme(axis.text.x = element_text(angle=90, hjust=1)) +
+  ggtitle("Attrition Percentage by Job Role")
+
+```
+
+Although the employee's job role didn't enter our predictive model for attrition, we see that the percentage of employees leaving varies between job roles. Sales representatives exhibit by far the highest turnover percentage.  
+
+Thank you for your attention! Please check out my guided presentation [here](https://youtu.be/Nu8fMSZ-4pU). 
+
